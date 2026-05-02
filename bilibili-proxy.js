@@ -62,25 +62,6 @@ const PROVIDERS = {
       return { error: '官方API未返回有效的视频地址' };
     },
   },
-
-  // injahow 第三方（备用）
-  injahow: {
-    name: 'injahow',
-    type: 'third_party',
-    weight: 30,
-    async parse(bv, part) {
-      const url = `https://api.injahow.cn/bparse/?bv=${bv}&p=${part}&q=80&format=mp4`;
-      const resp = await fetch(url, {
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.bilibili.com/' },
-      });
-      const data = await resp.json();
-
-      if (data.code === 0 && data.url) {
-        return { url: data.url };
-      }
-      return { error: `injahow失败: ${data.message || '未知错误'}` };
-    },
-  },
 };
 
 // ── 工具函数 ────────────────────────────────────────────
@@ -244,35 +225,25 @@ export default {
         return Response.redirect(cachedUrl, 302);
       }
 
-      // 确定要尝试的解析源
-      let providersToTry = [];
-      if (forceProvider && PROVIDERS[forceProvider]) {
-        providersToTry = [PROVIDERS[forceProvider]];
-      } else {
-        // 优先 official，失败再试 injahow
-        providersToTry = [PROVIDERS.official, PROVIDERS.injahow];
-      }
-
+      // 仅使用官方 API 解析
       const errors = [];
-      for (const provider of providersToTry) {
-        try {
-          const result = await provider.parse(bv, actualPart, env);
-          if (result.url) {
-            // 缓存 24h
-            ctx.waitUntil(setCache(bv, actualPart, result.url));
-            statSuccess(provider.name);
-            return Response.redirect(result.url, 302);
-          }
-          errors.push(`${provider.name}: ${result.error}`);
-          statFail(provider.name);
-        } catch (e) {
-          errors.push(`${provider.name}: 异常 - ${e.message}`);
-          statFail(provider.name);
+      try {
+        const result = await PROVIDERS.official.parse(bv, actualPart, env);
+        if (result.url) {
+          // 缓存 24h
+          ctx.waitUntil(setCache(bv, actualPart, result.url));
+          statSuccess(PROVIDERS.official.name);
+          return Response.redirect(result.url, 302);
         }
+        errors.push(`${PROVIDERS.official.name}: ${result.error}`);
+        statFail(PROVIDERS.official.name);
+      } catch (e) {
+        errors.push(`${PROVIDERS.official.name}: 异常 - ${e.message}`);
+        statFail(PROVIDERS.official.name);
       }
 
       return jsonResponse({
-        error: '所有解析源均失败',
+        error: '官方 API 解析失败',
         errors,
         suggestion: '请稍后重试，或提供 BILI_SESSDATA 环境变量以提高成功率',
         bv,
