@@ -183,13 +183,19 @@ async function handleVideo(request) {
       redirect: 'follow',
     });
 
+    // 修复：B站 CDN 偶尔返回非法状态码（如 0、600+），需要钳制到合法范围
+    let status = response.status;
+    if (status < 200 || status > 599) {
+      status = 502;
+    }
+
     const newHeaders = new Headers(response.headers);
     newHeaders.set('Access-Control-Allow-Origin', '*');
     newHeaders.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range');
     newHeaders.delete('set-cookie');
 
     return new Response(response.body, {
-      status: response.status,
+      status,
       headers: newHeaders,
     });
   } catch (e) {
