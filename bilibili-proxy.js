@@ -1,14 +1,15 @@
 /**
- * B站视频直链解析 Worker
- * 部署在 Cloudflare Workers，利用 CF IP 绕过服务器风控
+ * B站视频直链解析 Worker（v2）
+ * 部署在 Cloudflare Workers
  *
  * 接口：
  *   GET /bili?id=BVxxx           → 302 跳转到视频直链
  *   GET /bili?id=BVxxx&p=2       → 指定分P
- *   GET /bili?id=b23.tv短链        → 自动解析短链后跳转
- *   GET /resolve?id=xxx            → 只返回 {bv, part}，不跳转（供前端构造URL用）
- *   GET /health                    → 健康检查
- *   GET /stats                     → 统计信息（内存，重启后重置）
+ *   GET /bili?id=b23.tv短链       → 自动解析短链后跳转
+ *   GET /video?url=<base64url>   → 代理视频流（带 Referer，解决 CDN 403）
+ *   GET /resolve?id=xxx          → 只返回 {bv, part}，不跳转
+ *   GET /health                  → 健康检查
+ *   GET /stats                   → 统计信息（内存，重启后重置）
  *
  * 环境变量（可选）：
  *   BILI_SESSDATA   - B站登录态 SESSDATA（可选，提高画质上限）
@@ -41,7 +42,7 @@ const PROVIDERS = {
         cid = video.pages[part - 1].cid;
       }
 
-      // Step 2: 拿播放地址（qn=32: 480p，无登录也可用的画质）
+      // Step 2: 拿播放地址（qn=80: 1080p）
       const playUrl =
         `https://api.bilibili.com/x/player/playurl` +
         `?bvid=${bv}&cid=${cid}&qn=80&fnval=0&fnver=0&fourk=0`;
@@ -103,12 +104,10 @@ async function resolveBv(raw, env) {
       const finalUrl = resp.url;
       const bvMatch2 = finalUrl.match(/BV[a-zA-Z0-9]{10}/);
       if (bvMatch2) {
-        // 从最终 URL 里也提取 p 参数
         const pMatch2 = finalUrl.match(/[?&]p=(\d+)/);
         if (pMatch2) part = parseInt(pMatch2[1]);
         return { bv: bvMatch2[0], part };
       }
-      // 从响应体里找
       const text = await resp.text();
       const bvMatch3 = text.match(/BV[a-zA-Z0-9]{10}/);
       if (bvMatch3) return { bv: bvMatch3[0], part };
@@ -141,6 +140,63 @@ async function setCache(bv, part, url) {
   await cache.put(cacheKey, resp);
 }
 
+// ── 视频代理 ────────────────────────────────────────────
+
+async function handleVideo(request) {
+  const url = new URL(request.url);
+  const encodedUrl = url.searchParams.get('url') || '';
+
+  if (!encodedUrl) {
+    return jsonResponse({ error: '缺少参数 url' }, 400);
+  }
+
+  let videoUrl;
+  try {
+    // 支持 base64url 和普通 base64
+    let base64 = encodedUrl.replace(/-/g, '+').replace(/_/g, '/');
+    while (base64.length % 4 !== 0) base64 += '=';
+    videoUrl = atob(base64);
+  } catch (e) {
+    return jsonResponse({ error: 'invalid_url_encoding' }, 400);
+  }
+
+  if (!videoUrl.startsWith('https://') && !videoUrl.startsWith('http://')) {
+    return jsonResponse({ error: 'only_https_allowed' }, 403);
+  }
+
+  // 安全校验：只允许 bilivideo.com 域名
+  const parsedOrigin = new URL(videoUrl).hostname;
+  if (!parsedOrigin.endsWith('.bilivideo.com')) {
+    return jsonResponse({ error: `domain_not_allowed: ${parsedOrigin}` }, 403);
+  }
+
+  // 代理请求 B站 CDN，带上 Referer 绕过防盗链
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Referer': 'https://www.bilibili.com/',
+    'Origin': 'https://www.bilibili.com',
+  };
+
+  try {
+    const response = await fetch(videoUrl, {
+      headers,
+      redirect: 'follow',
+    });
+
+    const newHeaders = new Headers(response.headers);
+    newHeaders.set('Access-Control-Allow-Origin', '*');
+    newHeaders.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range');
+    newHeaders.delete('set-cookie');
+
+    return new Response(response.body, {
+      status: response.status,
+      headers: newHeaders,
+    });
+  } catch (e) {
+    return jsonResponse({ error: `video_proxy_failed: ${e.message}` }, 502);
+  }
+}
+
 // ── 统计（内存，Worker 重启后重置）──────────────────────
 const stats = {
   total: 0,
@@ -170,12 +226,25 @@ export default {
     const path = url.pathname;
     const params = url.searchParams;
 
+    // CORS 预检
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, OPTIONS',
+          'Access-Control-Max-Age': '86400',
+        },
+      });
+    }
+
     // ── /health ──
     if (path === '/health' || path === '/healthz') {
       return jsonResponse({
         status: 'healthy',
         service: 'bilibili-proxy-worker',
-        version: '1.0.0',
+        version: '2.0.0',
+        features: ['video_proxy'],
         timestamp: new Date().toISOString(),
       });
     }
@@ -201,6 +270,11 @@ export default {
       return jsonResponse({ bv: result.bv, part: result.part || 1 });
     }
 
+    // ── /video ── 视频流代理（带 Referer 绕过 CDN 防盗链）
+    if (path === '/video') {
+      return handleVideo(request);
+    }
+
     // ── /bili ── 主解析接口：302 跳转到直链
     if (path === '/bili') {
       const rawId = params.get('id') || '';
@@ -211,7 +285,6 @@ export default {
       const part = parseInt(params.get('p') || '1');
       const forceProvider = params.get('provider') || '';
 
-      // 解析 BV 号
       const resolved = await resolveBv(rawId, env);
       if (resolved.error) {
         return jsonResponse({ error: resolved.error }, 400);
@@ -219,18 +292,15 @@ export default {
       const bv = resolved.bv;
       const actualPart = resolved.part || part;
 
-      // 查缓存
       const cachedUrl = await getCache(bv, actualPart);
       if (cachedUrl) {
         return Response.redirect(cachedUrl, 302);
       }
 
-      // 仅使用官方 API 解析
       const errors = [];
       try {
         const result = await PROVIDERS.official.parse(bv, actualPart, env);
         if (result.url) {
-          // 缓存 24h
           ctx.waitUntil(setCache(bv, actualPart, result.url));
           statSuccess(PROVIDERS.official.name);
           return Response.redirect(result.url, 302);
@@ -252,7 +322,7 @@ export default {
     }
 
     // ── 404 ──
-    return new Response('Not Found\n\n可用接口:\n  /bili?id=BVxxx\n  /resolve?id=xxx\n  /health\n  /stats', {
+    return new Response('Not Found\n\nAvailable:\n  /bili?id=BVxxx\n  /video?url=<base64url>\n  /resolve?id=xxx\n  /health\n  /stats', {
       status: 404,
       headers: { 'Content-Type': 'text/plain; charset=utf-8' },
     });
