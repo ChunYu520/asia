@@ -177,6 +177,16 @@ async function handleVideo(request) {
     'Origin': 'https://www.bilibili.com',
   };
 
+  // 透传客户端的 Range 请求头（大视频分段加载必需）
+  const clientRange = request.headers.get('Range');
+  if (clientRange) {
+    headers['Range'] = clientRange;
+  }
+  const clientIfRange = request.headers.get('If-Range');
+  if (clientIfRange) {
+    headers['If-Range'] = clientIfRange;
+  }
+
   try {
     const response = await fetch(videoUrl, {
       headers,
